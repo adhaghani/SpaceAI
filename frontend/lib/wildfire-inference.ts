@@ -23,11 +23,7 @@ type InferenceResult = {
   model: string
 }
 
-const VLM_PROMPT =
-  "You are an orbital wildfire analyst operating on constrained satellite bandwidth. " +
-  "Inspect this Sentinel-2 false-color composite (SWIR/NIR/Red) and identify likely thermal anomalies, active flame fronts, or high-temperature smoke-obscured hotspots. " +
-  "Return STRICT JSON only in this exact schema: " +
-  '{"fire_detected": true|false, "confidence": 0.0-1.0, "lat": number, "lon": number, "severity": "low|medium|high"}'
+const IMAGE_PROVIDER = (process.env.IMAGE_PROVIDER ?? "sentinel").toLowerCase()
 
 const LM_STUDIO_ENABLED =
   (process.env.LM_STUDIO_ENABLED ?? "true").toLowerCase() === "true"
@@ -38,12 +34,47 @@ const LM_STUDIO_MODEL = process.env.LM_STUDIO_MODEL ?? "lfm2.5-vl-450m"
 const LM_STUDIO_TIMEOUT_SECONDS = Number(
   process.env.LM_STUDIO_TIMEOUT_SECONDS ?? "40"
 )
+const FIRE_MIN_CONFIDENCE = clamp(
+  Number(process.env.FIRE_MIN_CONFIDENCE ?? "0.7"),
+  0,
+  1
+)
+const FIRE_MAPBOX_MIN_CONFIDENCE = clamp(
+  Number(process.env.FIRE_MAPBOX_MIN_CONFIDENCE ?? "0.88"),
+  0,
+  1
+)
+const FIRE_ALLOW_LOW_SEVERITY =
+  (process.env.FIRE_ALLOW_LOW_SEVERITY ?? "false").toLowerCase() === "true"
+const FIRE_LOW_SEVERITY_OVERRIDE_CONFIDENCE = clamp(
+  Number(process.env.FIRE_LOW_SEVERITY_OVERRIDE_CONFIDENCE ?? "0.95"),
+  0,
+  1
+)
+
+const VLM_PROMPT_SENTINEL =
+  "You are an orbital wildfire analyst operating on constrained satellite bandwidth. " +
+  "Inspect this Sentinel-2 false-color composite (SWIR/NIR/Red) and identify likely thermal anomalies, active flame fronts, or high-temperature smoke-obscured hotspots. " +
+  "Avoid false positives from bare soil, urban heat islands, coastlines, sunglint, and cloud edges. " +
+  "Set fire_detected=true only when evidence is strong. " +
+  "Return STRICT JSON only in this exact schema: " +
+  '{"fire_detected": true|false, "confidence": 0.0-1.0, "lat": number, "lon": number, "severity": "low|medium|high"}'
+
+const VLM_PROMPT_MAPBOX =
+  "You are an orbital wildfire analyst reviewing Mapbox RGB satellite imagery. " +
+  "Mapbox images do not provide thermal bands, so do NOT infer fire from terrain color alone. " +
+  "Mark fire_detected=true only with clear visible wildfire cues (active flame fronts, dense plume/smoke source, burn scar progression). " +
+  "If cues are weak/ambiguous, return fire_detected=false with low confidence. " +
+  "Return STRICT JSON only in this exact schema: " +
+  '{"fire_detected": true|false, "confidence": 0.0-1.0, "lat": number, "lon": number, "severity": "low|medium|high"}'
 
 export async function runWildfireInference(
   input: InferenceInput
 ): Promise<InferenceResult> {
   const lat = toNumber(input.metadata?.lat, 0)
   const lon = toNumber(input.metadata?.lon, 0)
+  const promptUsed =
+    IMAGE_PROVIDER === "mapbox" ? VLM_PROMPT_MAPBOX : VLM_PROMPT_SENTINEL
 
   if (!LM_STUDIO_ENABLED) {
     return buildResult(
@@ -54,16 +85,22 @@ export async function runWildfireInference(
         lon,
         severity: "low",
       },
-      "lm-studio-disabled"
+      "lm-studio-disabled",
+      promptUsed
     )
   }
 
   try {
     const dataUrl = buildDataUrl(input.imageBase64, input.imageMimeType)
-    const content = await callLmStudio(dataUrl)
+    const content = await callLmStudio(dataUrl, promptUsed)
     const parsed = extractJsonObject(content)
     const normalized = normalizeResult(parsed, lat, lon)
-    return buildResult(normalized, `lm-studio:${LM_STUDIO_MODEL}`)
+    const policyAdjusted = applyDecisionPolicy(normalized)
+    return buildResult(
+      policyAdjusted,
+      `lm-studio:${LM_STUDIO_MODEL}`,
+      promptUsed
+    )
   } catch {
     return buildResult(
       {
@@ -73,12 +110,16 @@ export async function runWildfireInference(
         lon,
         severity: "low",
       },
-      "lm-studio-fallback"
+      "lm-studio-fallback",
+      promptUsed
     )
   }
 }
 
-async function callLmStudio(imageDataUrl: string): Promise<string> {
+async function callLmStudio(
+  imageDataUrl: string,
+  promptUsed: string
+): Promise<string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   }
@@ -110,7 +151,7 @@ async function callLmStudio(imageDataUrl: string): Promise<string> {
           {
             role: "user",
             content: [
-              { type: "text", text: VLM_PROMPT },
+              { type: "text", text: promptUsed },
               { type: "image_url", image_url: { url: imageDataUrl } },
             ],
           },
@@ -222,16 +263,52 @@ function normalizeResult(
 
 function buildResult(
   result: InferenceResult["result"],
-  model: string
+  model: string,
+  promptUsed: string
 ): InferenceResult {
   const payload_json = JSON.stringify(result)
   return {
     result,
     payload_json,
     payload_bytes: Buffer.byteLength(payload_json, "utf-8"),
-    prompt_used: VLM_PROMPT,
+    prompt_used: promptUsed,
     model,
   }
+}
+
+function applyDecisionPolicy(
+  result: InferenceResult["result"]
+): InferenceResult["result"] {
+  if (!result.fire_detected) {
+    return result
+  }
+
+  const minConfidence =
+    IMAGE_PROVIDER === "mapbox"
+      ? Math.max(FIRE_MIN_CONFIDENCE, FIRE_MAPBOX_MIN_CONFIDENCE)
+      : FIRE_MIN_CONFIDENCE
+
+  if (result.confidence < minConfidence) {
+    return {
+      ...result,
+      fire_detected: false,
+      severity: "low" as Severity,
+    }
+  }
+
+  if (
+    result.severity === "low" &&
+    !FIRE_ALLOW_LOW_SEVERITY &&
+    result.confidence < FIRE_LOW_SEVERITY_OVERRIDE_CONFIDENCE
+  ) {
+    return {
+      ...result,
+      fire_detected: false,
+      severity: "low" as Severity,
+    }
+  }
+
+  return result
 }
 
 function buildDataUrl(base64: string, mime?: string | null): string {
