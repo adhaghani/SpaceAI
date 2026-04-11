@@ -1,12 +1,11 @@
 # Frontend - SpaceAI Dashboard
 
-Next.js App Router dashboard for live SimSat telemetry, false-color observation frames, onboard AI alerts, and bandwidth metrics.
+Next.js App Router dashboard for live SimSat telemetry, observation frames, simulation control, and mission logs.
 
 ## Start
 
 ```bash
 npm install
-cp .env.local.example .env.local
 npm run dev
 ```
 
@@ -14,13 +13,32 @@ Default URL: `http://localhost:3000`
 
 ## Environment
 
-Set backend endpoint in `.env.local`:
+This frontend uses local Next.js route handlers:
+
+- GET /api/state proxies SimSat state and image data.
+- POST /api/control relays simulation commands to SimSat dashboard API.
+
+Optional server-side environment overrides:
 
 ```env
-NEXT_PUBLIC_BACKEND_URL=http://localhost:8001
+SIMSAT_CONTROL_URL=http://localhost:8000
+SIMSAT_DATA_URL=http://localhost:9005
+IMAGE_PROVIDER=mapbox
+SPECTRAL_BANDS=swir22,nir,red
+SIZE_KM=10.0
+WINDOW_SECONDS=864000
+MAPBOX_TARGET_LON=
+MAPBOX_TARGET_LAT=
+IMAGE_FETCH_TIMEOUT_MS=8000
+IMAGE_FETCH_RETRIES=2
+IMAGE_FETCH_RETRY_DELAY_MS=250
+IMAGE_FETCH_SUPPRESS_UPSTREAM_5XX=true
+IMAGE_FETCH_SUPPRESS_TIMEOUT_ABORT=true
 ```
 
-The dashboard polls `${NEXT_PUBLIC_BACKEND_URL}/api/state` every 2 seconds and sends simulation controls to `${NEXT_PUBLIC_BACKEND_URL}/api/control`.
+The dashboard polls /api/state every 5 seconds and posts controls to /api/control.
+
+Bandwidth dashboard values are cumulative across the current browser session.
 
 ## shadcn
 

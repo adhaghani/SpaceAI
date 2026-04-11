@@ -2,69 +2,54 @@
 
 End-to-end wildfire intelligence simulation for the AI in Space challenge (Liquid AI + DPhi Space).
 
-SpaceAI demonstrates how satellites can perform onboard fire analysis and transmit compact alerts instead of streaming full imagery continuously.
+SpaceAI now runs in SimSat-direct mode: the Next.js app proxies SimSat APIs and renders mission telemetry and observations without requiring a separate Python backend process.
 
 ## What This App Does
 
 SpaceAI runs a continuous orbit-style monitoring loop:
 
-1. Pulls live orbital telemetry from SimSat (latitude, longitude, altitude, timestamp)
-2. Fetches current Sentinel-style false-color observations (SWIR/NIR/Red)
-3. Runs image analysis for wildfire indicators using a VLM path (LM Studio LFM-style) with safe fallback behavior
-4. Produces strict JSON wildfire events (`fire_detected`, `confidence`, `lat`, `lon`, `severity`)
-5. Calculates downlink payload size to compare event-only transmission vs raw image transmission
-6. Streams all state to a real-time web dashboard
+1. Pulls live orbital telemetry from SimSat.
+2. Fetches current observation imagery from SimSat (Mapbox or Sentinel provider).
+3. Renders observation and state in a live dashboard.
+4. Relays simulation control commands (start and pause) to SimSat.
+5. Tracks request logs and cumulative payload-size savings metrics in the UI.
 
-If no valid observation image is available for the current footprint, the UI explicitly shows a no-observation message rather than presenting fallback AI output as a true observation result.
+When no valid observation image is available for the current footprint (for example ocean coverage), the UI clearly shows that no image is available.
 
 ## Primary Use Case
 
-The app is designed for low-bandwidth emergency monitoring from orbit.
+This app is designed for mission prototyping and hackathon workflows where you need to:
 
-Instead of downlinking every image frame to ground stations, SpaceAI shows a more scalable pattern:
-
-- Analyze imagery onboard
-- Transmit only compact, actionable alerts
-- Preserve bandwidth for critical events
-
-This is useful for:
-
-- Early wildfire detection over remote regions
-- Continuous space-based situational awareness
-- Mission concepts where communication windows and throughput are constrained
-- Demonstrating edge-AI decision support pipelines in aerospace systems
+- Control and visualize a simulated orbit quickly.
+- Access current position and observation imagery from SimSat APIs.
+- Build application logic and UI around real simulation outputs.
+- Avoid running a separate custom backend service for basic state and control.
 
 ## Functional Capabilities
 
-- Real-time telemetry ingestion from SimSat
-- Observation image ingestion with metadata propagation
-- Vision-language inference integration seam in `backend/inference.py`
-- LM Studio OpenAI-compatible integration for local LFM-style testing
-- Deterministic fallback logic for resilience when model inference is unavailable
-- Compact JSON downlink payload generation and byte-size accounting
-- Live dashboard for telemetry, observation view, alert feed, and bandwidth savings
-- Client-side request logs for operational debugging
+- Real-time telemetry ingestion from SimSat.
+- Mapbox and Sentinel image retrieval through SimSat image endpoints.
+- Local API proxy routes in Next.js for state and simulation control.
+- Live mission dashboard for telemetry, observation image, status badges, request logs, and cumulative bandwidth savings.
+- Direct integration with SimSat control API and data API.
 
 ## End-to-End Flow
 
-1. SimSat data API provides current position and image observation.
-2. Backend (`FastAPI`) processes each cycle in a polling loop.
-3. Inference module analyzes image and normalizes structured wildfire output.
-4. Backend computes payload vs raw image byte metrics.
-5. Frontend (`Next.js`) polls backend state every 2 seconds and renders mission status.
+1. SimSat dashboard API receives control commands.
+2. SimSat data API provides current position and current image.
+3. Next.js API routes aggregate and normalize response payloads.
+4. Frontend polls local routes every 5 seconds and renders mission state.
 
 ## Project Structure
 
 ```text
-backend/
-  __init__.py
-  main.py
-  simsat_client.py
-  inference.py
-  requirements.txt
-  .env.example
 frontend/
   app/
+    api/
+      control/
+        route.ts
+      state/
+        route.ts
     layout.tsx
     page.tsx
     globals.css
@@ -73,7 +58,7 @@ frontend/
   package.json
   postcss.config.mjs
   components.json
-  .env.local.example
+  .env.example
 README.md
 ```
 
@@ -81,49 +66,21 @@ README.md
 
 - SimSat control API running at http://localhost:8000
 - SimSat data API running at http://localhost:9005
-- Python 3.11+
 - Node.js 20+
 
-## 1) Backend Setup (FastAPI)
-
-From project root:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r backend/requirements.txt
-cp backend/.env.example backend/.env
-uvicorn backend.main:app --reload --port 8001
-```
-
-Backend endpoints:
-
-- `GET /api/state` - latest telemetry, image, VLM result, and bandwidth metrics
-- `POST /api/control` - relay simulation commands to SimSat control API
-- `GET /health` - basic health probe
-
-Example control command:
-
-```bash
-curl -X POST http://localhost:8001/api/control \
-  -H "Content-Type: application/json" \
-  -d '{"command":"start","kwargs":{}}'
-```
-
-## 2) Frontend Setup (Next.js + shadcn/ui)
+## 1) Frontend Setup (Next.js + shadcn/ui)
 
 From project root:
 
 ```bash
 cd frontend
 npm install
-cp .env.local.example .env.local
 npm run dev
 ```
 
-Frontend runs at http://localhost:3000 and polls backend state every 2 seconds.
+Frontend runs at http://localhost:3000 and polls local API routes every 5 seconds.
 
-## 3) shadcn Initialization Command (Required by Challenge Notes)
+## 2) shadcn Initialization Command (Required by Challenge Notes)
 
 If you need to initialize shadcn in a fresh frontend clone:
 
@@ -134,7 +91,7 @@ npx shadcn-ui@latest init
 
 This repository already contains a working shadcn setup and components in `frontend/components/ui`.
 
-## 4) Tailwind Configuration Notes
+## 3) Tailwind Configuration Notes
 
 This frontend uses Tailwind CSS v4 (CSS-first configuration):
 
@@ -142,80 +99,25 @@ This frontend uses Tailwind CSS v4 (CSS-first configuration):
 - PostCSS integration is in `frontend/postcss.config.mjs`
 - No `tailwind.config.*` file is required for this setup
 
-## 5) Run Everything Together
+## 4) Run Everything Together
 
-Use three terminals:
+Use two terminals:
 
 Terminal A (SimSat):
 
 - Start SimSat services so APIs are available on ports 8000 and 9005
 
-Terminal B (Backend):
-
-```bash
-source .venv/bin/activate
-uvicorn backend.main:app --reload --port 8001
-```
-
-Terminal C (Frontend):
+Terminal B (Frontend):
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-## 6) Liquid AI Model Integration
-
-The integration seam is in `backend/inference.py` inside `analyze_for_fire(...)`.
-
-Current behavior:
-
-- Uses deterministic heuristic placeholder by default
-- Supports LM Studio integration for local LFM2-VL-style inference when enabled
-- Produces strict JSON output like:
-
-```json
-{
-  "fire_detected": true,
-  "confidence": 0.95,
-  "lat": 12.34,
-  "lon": 56.78,
-  "severity": "high"
-}
-```
-
-- Computes UTF-8 byte size of this JSON payload to simulate downlink bandwidth usage
-
-### Enable LM Studio (Local) Integration
-
-1. Start LM Studio local server with a vision-language model loaded.
-2. Configure backend env (in `backend/.env`):
-
-```env
-LM_STUDIO_ENABLED=true
-LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
-LM_STUDIO_MODEL=lfm2-vl
-LM_STUDIO_TIMEOUT_SECONDS=40
-```
-
-3. Start backend with env file:
-
-```bash
-uvicorn backend.main:app --reload --port 8001 --env-file backend/.env
-```
-
-If LM Studio is unavailable or returns invalid output, backend automatically falls back to heuristic inference so the stream remains live.
-
-### Notes for direct Liquid SDK integration
-
-- Replace the LM Studio call in `backend/inference.py` with official Liquid API/SDK calls
-- Keep `VLM_PROMPT` contract and JSON validation helpers
-- Continue returning strict schema and payload byte metrics
-
-## 7) Demo Workflow
+## 5) Demo Workflow
 
 1. Open dashboard at http://localhost:3000
 2. Click Start Simulation
 3. Watch telemetry and observation frames update
-4. Inspect AI Alert Feed JSON output
-5. Compare raw image bytes vs payload bytes in Bandwidth Dashboard
+4. Use Start and Pause controls from the command panel
+5. Inspect request logs and state panels for live API activity

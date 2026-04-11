@@ -65,8 +65,20 @@ type RequestLog = {
   detail?: string
 }
 
-const BACKEND_BASE_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8001"
+type HttpError = Error & {
+  status?: number
+}
+
+type ControlResponse = {
+  ok?: boolean
+  detail?: string
+  result?: unknown
+}
+
+type CumulativeBandwidth = {
+  rawImageBytes: number
+  vlmPayloadBytes: number
+}
 
 const defaultState: ApiState = {
   updated_at: null,
@@ -99,8 +111,15 @@ export default function Page() {
   const [state, setState] = useState<ApiState>(defaultState)
   const [loading, setLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
+  const [fetchStatus, setFetchStatus] = useState<number | null>(null)
   const [controlBusy, setControlBusy] = useState<"start" | "pause" | null>(null)
   const [requestLogs, setRequestLogs] = useState<RequestLog[]>([])
+  const [imageLoadError, setImageLoadError] = useState(false)
+  const [cumulativeBandwidth, setCumulativeBandwidth] =
+    useState<CumulativeBandwidth>({
+      rawImageBytes: 0,
+      vlmPayloadBytes: 0,
+    })
 
   const addRequestLog = (log: Omit<RequestLog, "id">) => {
     setRequestLogs((prev) => {
@@ -111,14 +130,18 @@ export default function Page() {
 
   useEffect(() => {
     let active = true
+    let nextPoll: ReturnType<typeof setTimeout> | null = null
 
     const fetchState = async () => {
       const startedAt = performance.now()
+      let status = 0
 
       try {
-        const response = await fetch(`${BACKEND_BASE_URL}/api/state`, {
+        const response = await fetch(`/api/state?ts=${Date.now()}`, {
           cache: "no-store",
         })
+
+        status = response.status
 
         addRequestLog({
           timestamp: new Date().toISOString(),
@@ -130,7 +153,16 @@ export default function Page() {
         })
 
         if (!response.ok) {
-          throw new Error(`State fetch failed with status ${response.status}`)
+          const body = (await response.json().catch(() => null)) as {
+            detail?: string
+          } | null
+          const error = new Error(
+            body?.detail
+              ? `State fetch failed (${response.status}): ${body.detail}`
+              : `State fetch failed with status ${response.status}`
+          ) as HttpError
+          error.status = response.status
+          throw error
         }
 
         const json = (await response.json()) as ApiState
@@ -139,13 +171,26 @@ export default function Page() {
         }
 
         setState(json)
+        setCumulativeBandwidth((prev) => ({
+          rawImageBytes:
+            prev.rawImageBytes + Math.max(0, json.bandwidth.raw_image_bytes),
+          vlmPayloadBytes:
+            prev.vlmPayloadBytes +
+            Math.max(0, json.bandwidth.vlm_payload_bytes),
+        }))
         setFetchError(null)
+        setFetchStatus(null)
       } catch (error) {
+        const errorStatus =
+          typeof error === "object" && error !== null && "status" in error
+            ? Number((error as HttpError).status ?? 0)
+            : status
+
         addRequestLog({
           timestamp: new Date().toISOString(),
           method: "GET",
           endpoint: "/api/state",
-          status: 0,
+          status: errorStatus,
           ok: false,
           durationMs: Math.round(performance.now() - startedAt),
           detail:
@@ -159,19 +204,22 @@ export default function Page() {
         setFetchError(
           error instanceof Error ? error.message : "Unknown fetch error"
         )
+        setFetchStatus(errorStatus || null)
       } finally {
         if (active) {
           setLoading(false)
+          nextPoll = setTimeout(fetchState, 5000)
         }
       }
     }
 
     fetchState()
-    const interval = setInterval(fetchState, 2000)
 
     return () => {
       active = false
-      clearInterval(interval)
+      if (nextPoll) {
+        clearTimeout(nextPoll)
+      }
     }
   }, [])
 
@@ -183,44 +231,79 @@ export default function Page() {
     return `data:${mime};base64,${state.image_base64}`
   }, [state.image_available, state.image_base64, state.image_mime_type])
 
-  const alertVariant = state.vlm_result.fire_detected
-    ? "destructive"
-    : "secondary"
-  const alertLabel = state.vlm_result.fire_detected ? "FIRE DETECTED" : "CLEAR"
+  useEffect(() => {
+    setImageLoadError(false)
+  }, [imageUrl])
+
+  const hasAIResult = Boolean(state.vlm_payload_json)
+  const alertVariant =
+    hasAIResult && state.vlm_result.fire_detected ? "destructive" : "secondary"
+  const alertLabel = hasAIResult
+    ? state.vlm_result.fire_detected
+      ? "FIRE DETECTED"
+      : "CLEAR"
+    : "SIMULATION ONLY"
   const hasObservation = Boolean(imageUrl)
+  const hasServerStateError = Boolean(fetchStatus && fetchStatus >= 500)
   const errorLogs = requestLogs.filter((log) => !log.ok)
+  const cumulativeSavingsPercent =
+    cumulativeBandwidth.rawImageBytes > 0
+      ? ((cumulativeBandwidth.rawImageBytes -
+          cumulativeBandwidth.vlmPayloadBytes) /
+          cumulativeBandwidth.rawImageBytes) *
+        100
+      : 0
 
   const controlSimulation = async (command: "start" | "pause") => {
     const startedAt = performance.now()
+    let status = 0
 
     try {
       setControlBusy(command)
       setFetchError(null)
+      setFetchStatus(null)
 
-      const response = await fetch(`${BACKEND_BASE_URL}/api/control`, {
+      const response = await fetch(`/api/control`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command, kwargs: {} }),
       })
+
+      status = response.status
+      const body = (await response
+        .json()
+        .catch(() => null)) as ControlResponse | null
 
       addRequestLog({
         timestamp: new Date().toISOString(),
         method: "POST",
         endpoint: `/api/control (${command})`,
         status: response.status,
-        ok: response.ok,
+        ok: response.ok && body?.ok !== false,
         durationMs: Math.round(performance.now() - startedAt),
+        detail: body?.detail,
       })
 
-      if (!response.ok) {
-        throw new Error(`Control command failed: ${response.status}`)
+      if (!response.ok || body?.ok === false) {
+        const error = new Error(
+          body?.detail
+            ? `Control command failed (${response.status}): ${body.detail}`
+            : `Control command failed: ${response.status}`
+        ) as HttpError
+        error.status = response.status
+        throw error
       }
     } catch (error) {
+      const errorStatus =
+        typeof error === "object" && error !== null && "status" in error
+          ? Number((error as HttpError).status ?? 0)
+          : status
+
       addRequestLog({
         timestamp: new Date().toISOString(),
         method: "POST",
         endpoint: `/api/control (${command})`,
-        status: 0,
+        status: errorStatus,
         ok: false,
         durationMs: Math.round(performance.now() - startedAt),
         detail:
@@ -248,7 +331,7 @@ export default function Page() {
             </CardTitle>
             <CardDescription>
               Continuous Sentinel-2 SWIR/NIR/Red monitoring with low-bandwidth
-              VLM alerts.
+              direct SimSat integration.
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -270,7 +353,7 @@ export default function Page() {
               </Button>
               <Badge variant="outline" className="gap-1">
                 <Radio />
-                Polling every 2 seconds
+                Polling every 5 seconds
               </Badge>
               <Badge variant={alertVariant}>{alertLabel}</Badge>
             </div>
@@ -295,7 +378,7 @@ export default function Page() {
                 Telemetry
               </CardTitle>
             </CardHeader>
-            <CardContent className="grid grid-cols-2 gap-3 text-sm">
+            <CardContent className="grid grid-cols-1 gap-3 text-sm">
               <TelemetryItem
                 label="Latitude"
                 value={formatNumber(state.telemetry.lat, 4)}
@@ -328,16 +411,29 @@ export default function Page() {
                 <div className="flex h-72 items-center justify-center rounded-xl border border-border/60 bg-muted/35 text-sm text-muted-foreground">
                   Awaiting stream...
                 </div>
-              ) : imageUrl ? (
-                <div className="relative h-72 w-full overflow-hidden rounded-xl border border-border/70">
+              ) : hasServerStateError ? (
+                <div className="flex h-72 flex-col items-center justify-center gap-2 rounded-xl border border-destructive/40 bg-destructive/10 text-center text-sm text-destructive">
+                  <AlertTriangle />
+                  State service returned {fetchStatus}. Observation stream is
+                  temporarily unavailable.
+                </div>
+              ) : imageUrl && !imageLoadError ? (
+                <div className="relative aspect-square w-full overflow-hidden rounded-xl border border-border/70">
                   <Image
                     src={imageUrl}
                     alt="Current Sentinel-2 false color frame"
                     fill
                     unoptimized
                     sizes="(max-width: 1024px) 100vw, 66vw"
-                    className="object-cover"
+                    className="aspect-square object-cover"
+                    onError={() => setImageLoadError(true)}
                   />
+                </div>
+              ) : imageLoadError ? (
+                <div className="flex h-72 flex-col items-center justify-center gap-2 rounded-xl border border-destructive/40 bg-destructive/10 text-center text-sm text-destructive">
+                  <AlertTriangle />
+                  Latest image frame could not be rendered. Waiting for the next
+                  valid frame.
                 </div>
               ) : (
                 <div className="flex h-72 flex-col items-center justify-center gap-2 rounded-xl border border-border/60 bg-muted/35 text-center text-sm text-muted-foreground">
@@ -363,7 +459,7 @@ export default function Page() {
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
-              {hasObservation ? (
+              {hasAIResult ? (
                 <>
                   <div className="flex items-center gap-2">
                     <Badge variant={alertVariant}>{alertLabel}</Badge>
@@ -383,8 +479,9 @@ export default function Page() {
                 </>
               ) : (
                 <div className="rounded-lg border border-border/60 bg-muted/25 px-3 py-2 text-sm text-muted-foreground">
-                  No observation image available for this frame. AI analysis
-                  will appear once a valid image is received.
+                  {hasObservation
+                    ? "Inference did not return a valid alert for this frame yet."
+                    : "No observation image available for this frame. AI alert payload appears when a valid frame is received."}
                 </div>
               )}
               {state.errors.length > 0 ? (
@@ -409,23 +506,20 @@ export default function Page() {
             <CardContent className="flex flex-col gap-4">
               <MetricRow
                 label="Raw Image"
-                value={formatBytes(state.bandwidth.raw_image_bytes)}
+                value={formatBytes(cumulativeBandwidth.rawImageBytes)}
               />
               <MetricRow
                 label="VLM Alert Payload"
-                value={formatBytes(state.bandwidth.vlm_payload_bytes)}
+                value={formatBytes(cumulativeBandwidth.vlmPayloadBytes)}
               />
               <MetricRow
                 label="Estimated Savings"
-                value={`${state.bandwidth.savings_percent.toFixed(2)}%`}
+                value={`${cumulativeSavingsPercent.toFixed(2)}%`}
               />
-              <Progress
-                value={state.bandwidth.savings_percent}
-                className="h-2"
-              />
+              <Progress value={cumulativeSavingsPercent} className="h-2" />
               <div className="text-xs text-muted-foreground">
-                Mission goal: maximize downlink efficiency while preserving
-                actionable fire alerts.
+                Mission goal: maximize cumulative downlink efficiency while
+                preserving actionable fire alerts.
               </div>
             </CardContent>
           </Card>
