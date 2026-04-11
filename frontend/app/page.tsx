@@ -80,6 +80,14 @@ type CumulativeBandwidth = {
   vlmPayloadBytes: number
 }
 
+type AlertPayload = {
+  fire_detected: boolean
+  confidence: number
+  lat: number
+  lon: number
+  severity: "low" | "medium" | "high"
+}
+
 const defaultState: ApiState = {
   updated_at: null,
   telemetry: {
@@ -236,10 +244,35 @@ export default function Page() {
   }, [imageUrl])
 
   const hasAIResult = Boolean(state.vlm_payload_json)
+  const aiPayload: AlertPayload = useMemo(() => {
+    if (state.vlm_payload_json) {
+      try {
+        const parsed = JSON.parse(
+          state.vlm_payload_json
+        ) as Partial<AlertPayload>
+        if (
+          typeof parsed.fire_detected === "boolean" &&
+          typeof parsed.confidence === "number" &&
+          typeof parsed.lat === "number" &&
+          typeof parsed.lon === "number" &&
+          (parsed.severity === "low" ||
+            parsed.severity === "medium" ||
+            parsed.severity === "high")
+        ) {
+          return parsed as AlertPayload
+        }
+      } catch {
+        // Fall back to normalized state payload if JSON parsing fails.
+      }
+    }
+
+    return state.vlm_result
+  }, [state.vlm_payload_json, state.vlm_result])
+
   const alertVariant =
-    hasAIResult && state.vlm_result.fire_detected ? "destructive" : "secondary"
+    hasAIResult && aiPayload.fire_detected ? "destructive" : "secondary"
   const alertLabel = hasAIResult
-    ? state.vlm_result.fire_detected
+    ? aiPayload.fire_detected
       ? "FIRE DETECTED"
       : "CLEAR"
     : "SIMULATION ONLY"
@@ -418,7 +451,7 @@ export default function Page() {
                   temporarily unavailable.
                 </div>
               ) : imageUrl && !imageLoadError ? (
-                <div className="relative aspect-square w-full overflow-hidden rounded-xl border border-border/70">
+                <div className="relative h-76 w-full overflow-hidden rounded-xl border border-border/70">
                   <Image
                     src={imageUrl}
                     alt="Current Sentinel-2 false color frame"
@@ -464,18 +497,32 @@ export default function Page() {
                   <div className="flex items-center gap-2">
                     <Badge variant={alertVariant}>{alertLabel}</Badge>
                     <Badge variant="outline">
-                      Severity: {state.vlm_result.severity}
+                      Severity: {aiPayload.severity}
                     </Badge>
                     <Badge variant="outline">
-                      Confidence:{" "}
-                      {(state.vlm_result.confidence * 100).toFixed(1)}%
+                      Confidence: {(aiPayload.confidence * 100).toFixed(1)}%
                     </Badge>
                   </div>
                   <Separator />
-                  <pre className="overflow-x-auto rounded-lg border border-border/70 bg-muted/35 p-3 text-xs leading-relaxed">
-                    {state.vlm_payload_json ??
-                      JSON.stringify(state.vlm_result, null, 2)}
-                  </pre>
+                  <div className="grid gap-2 rounded-lg border border-border/70 bg-muted/35 p-3 text-sm">
+                    <MetricRow
+                      label="Fire Detected"
+                      value={aiPayload.fire_detected ? "Yes" : "No"}
+                    />
+                    <MetricRow
+                      label="Confidence"
+                      value={`${(aiPayload.confidence * 100).toFixed(1)}%`}
+                    />
+                    <MetricRow
+                      label="Latitude"
+                      value={aiPayload.lat.toFixed(6)}
+                    />
+                    <MetricRow
+                      label="Longitude"
+                      value={aiPayload.lon.toFixed(6)}
+                    />
+                    <MetricRow label="Severity" value={aiPayload.severity} />
+                  </div>
                 </>
               ) : (
                 <div className="rounded-lg border border-border/60 bg-muted/25 px-3 py-2 text-sm text-muted-foreground">
