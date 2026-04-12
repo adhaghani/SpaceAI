@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server"
+import { createHash } from "node:crypto"
 
 import { runWildfireInference } from "@/lib/wildfire-inference"
 
@@ -22,6 +23,16 @@ type ApiState = {
     lat: number
     lon: number
     severity: "low" | "medium" | "high"
+    flood_detected: boolean
+    drought_detected: boolean
+    oil_spill_detected: boolean
+    deforestation_detected: boolean
+    disasters: {
+      flood: { detected: boolean; confidence: number }
+      drought: { detected: boolean; confidence: number }
+      oil_spill: { detected: boolean; confidence: number }
+      deforestation: { detected: boolean; confidence: number }
+    }
   }
   vlm_payload_json: string | null
   bandwidth: {
@@ -55,6 +66,17 @@ const IMAGE_FETCH_SUPPRESS_UPSTREAM_5XX =
 const IMAGE_FETCH_SUPPRESS_TIMEOUT_ABORT =
   (process.env.IMAGE_FETCH_SUPPRESS_TIMEOUT_ABORT ?? "true").toLowerCase() ===
   "true"
+const INFERENCE_CACHE_TTL_MS = Math.max(
+  1000,
+  Number(process.env.INFERENCE_CACHE_TTL_MS ?? "30000") || 30000
+)
+
+type CachedInference = {
+  expiresAt: number
+  value: Awaited<ReturnType<typeof runWildfireInference>>
+}
+
+const inferenceCache = new Map<string, CachedInference>()
 
 export async function GET() {
   const errors: string[] = []
@@ -79,6 +101,16 @@ export async function GET() {
     lat: 0,
     lon: 0,
     severity: "low",
+    flood_detected: false,
+    drought_detected: false,
+    oil_spill_detected: false,
+    deforestation_detected: false,
+    disasters: {
+      flood: { detected: false, confidence: 0 },
+      drought: { detected: false, confidence: 0 },
+      oil_spill: { detected: false, confidence: 0 },
+      deforestation: { detected: false, confidence: 0 },
+    },
   }
   let vlmPayloadJson: string | null = null
   let vlmPayloadBytes = 0
@@ -138,7 +170,13 @@ export async function GET() {
 
   if (imageAvailable && imageBase64) {
     try {
-      const inference = await runWildfireInference({
+      const cacheKey = buildInferenceCacheKey(
+        imageBase64,
+        imageMimeType,
+        telemetry.lat,
+        telemetry.lon
+      )
+      const inference = await getOrRunInference(cacheKey, {
         imageBase64,
         imageMimeType,
         metadata: {
@@ -366,6 +404,48 @@ async function fetchCurrentImageWithRetries(
 
 async function sleep(ms: number) {
   await new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)))
+}
+
+function buildInferenceCacheKey(
+  imageBase64: string,
+  imageMimeType: string | null,
+  lat: number | null,
+  lon: number | null
+): string {
+  const digest = createHash("sha256").update(imageBase64).digest("hex")
+  return `${imageMimeType ?? "image/png"}:${lat ?? 0}:${lon ?? 0}:${digest}`
+}
+
+async function getOrRunInference(
+  cacheKey: string,
+  input: Parameters<typeof runWildfireInference>[0]
+) {
+  const now = Date.now()
+  const cached = inferenceCache.get(cacheKey)
+
+  if (cached && cached.expiresAt > now) {
+    return cached.value
+  }
+
+  const value = await runWildfireInference(input)
+  inferenceCache.set(cacheKey, {
+    expiresAt: now + INFERENCE_CACHE_TTL_MS,
+    value,
+  })
+  pruneExpiredInferenceCache(now)
+  return value
+}
+
+function pruneExpiredInferenceCache(now: number) {
+  if (inferenceCache.size <= 128) {
+    return
+  }
+
+  for (const [key, value] of inferenceCache) {
+    if (value.expiresAt <= now) {
+      inferenceCache.delete(key)
+    }
+  }
 }
 
 function isAbortError(error: unknown) {

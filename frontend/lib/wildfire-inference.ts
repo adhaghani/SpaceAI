@@ -1,5 +1,14 @@
 type Severity = "low" | "medium" | "high"
 
+type DisasterType = "flood" | "drought" | "oil_spill" | "deforestation"
+
+type DisasterAssessment = {
+  detected: boolean
+  confidence: number
+}
+
+type DisasterAssessments = Record<DisasterType, DisasterAssessment>
+
 type InferenceInput = {
   imageBase64: string
   imageMimeType?: string | null
@@ -16,6 +25,11 @@ type InferenceResult = {
     lat: number
     lon: number
     severity: Severity
+    flood_detected: boolean
+    drought_detected: boolean
+    oil_spill_detected: boolean
+    deforestation_detected: boolean
+    disasters: DisasterAssessments
   }
   payload_json: string
   payload_bytes: number
@@ -51,22 +65,26 @@ const FIRE_LOW_SEVERITY_OVERRIDE_CONFIDENCE = clamp(
   0,
   1
 )
+const DISASTER_MIN_CONFIDENCE = clamp(
+  Number(process.env.DISASTER_MIN_CONFIDENCE ?? "0.82"),
+  0,
+  1
+)
+const DISASTER_STRICT_MIN_CONFIDENCE = clamp(
+  Number(process.env.DISASTER_STRICT_MIN_CONFIDENCE ?? "0.9"),
+  0,
+  1
+)
 
 const VLM_PROMPT_SENTINEL =
-  "You are an orbital wildfire analyst operating on constrained satellite bandwidth. " +
-  "Inspect this Sentinel-2 false-color composite (SWIR/NIR/Red) and identify likely thermal anomalies, active flame fronts, or high-temperature smoke-obscured hotspots. " +
-  "Avoid false positives from bare soil, urban heat islands, coastlines, sunglint, and cloud edges. " +
-  "Set fire_detected=true only when evidence is strong. " +
-  "Return STRICT JSON only in this exact schema: " +
-  '{"fire_detected": true|false, "confidence": 0.0-1.0, "lat": number, "lon": number, "severity": "low|medium|high"}'
+  "Satellite disaster triage (precision-first). Analyze Sentinel-2 false-color image for wildfire, flood, drought, oil spill, and deforestation evidence. " +
+  "Avoid weak/ambiguous cues. If unsure, mark false with low confidence. Return STRICT JSON only: " +
+  '{"fire_detected":bool,"flood_detected":bool,"drought_detected":bool,"oil_spill_detected":bool,"deforestation_detected":bool,"confidence":0-1,"flood_confidence":0-1,"drought_confidence":0-1,"oil_spill_confidence":0-1,"deforestation_confidence":0-1,"lat":number,"lon":number,"severity":"low|medium|high"}'
 
 const VLM_PROMPT_MAPBOX =
-  "You are an orbital wildfire analyst reviewing Mapbox RGB satellite imagery. " +
-  "Mapbox images do not provide thermal bands, so do NOT infer fire from terrain color alone. " +
-  "Mark fire_detected=true only with clear visible wildfire cues (active flame fronts, dense plume/smoke source, burn scar progression). " +
-  "If cues are weak/ambiguous, return fire_detected=false with low confidence. " +
-  "Return STRICT JSON only in this exact schema: " +
-  '{"fire_detected": true|false, "confidence": 0.0-1.0, "lat": number, "lon": number, "severity": "low|medium|high"}'
+  "Satellite disaster triage on RGB imagery (precision-first). Detect only strong visual evidence for wildfire, flood, drought, oil spill, and deforestation. " +
+  "Do not infer thermal cues from color alone. If uncertain, return false with low confidence. Return STRICT JSON only: " +
+  '{"fire_detected":bool,"flood_detected":bool,"drought_detected":bool,"oil_spill_detected":bool,"deforestation_detected":bool,"confidence":0-1,"flood_confidence":0-1,"drought_confidence":0-1,"oil_spill_confidence":0-1,"deforestation_confidence":0-1,"lat":number,"lon":number,"severity":"low|medium|high"}'
 
 export async function runWildfireInference(
   input: InferenceInput
@@ -84,6 +102,11 @@ export async function runWildfireInference(
         lat,
         lon,
         severity: "low",
+        flood_detected: false,
+        drought_detected: false,
+        oil_spill_detected: false,
+        deforestation_detected: false,
+        disasters: defaultDisasterAssessments(),
       },
       "lm-studio-disabled",
       promptUsed
@@ -109,6 +132,11 @@ export async function runWildfireInference(
         lat,
         lon,
         severity: "low",
+        flood_detected: false,
+        drought_detected: false,
+        oil_spill_detected: false,
+        deforestation_detected: false,
+        disasters: defaultDisasterAssessments(),
       },
       "lm-studio-fallback",
       promptUsed
@@ -143,10 +171,11 @@ async function callLmStudio(
       body: JSON.stringify({
         model: LM_STUDIO_MODEL,
         temperature: 0,
+        max_tokens: 180,
         messages: [
           {
             role: "system",
-            content: "You are a strict JSON-only orbital wildfire detector.",
+            content: "Return compact strict JSON only.",
           },
           {
             role: "user",
@@ -252,12 +281,36 @@ function normalizeResult(
   const lat = toNumber(raw.lat, fallbackLat)
   const lon = toNumber(raw.lon, fallbackLon)
 
+  const disasters: DisasterAssessments = {
+    flood: {
+      detected: toBoolean(raw.flood_detected),
+      confidence: clamp(toNumber(raw.flood_confidence, 0.01), 0, 1),
+    },
+    drought: {
+      detected: toBoolean(raw.drought_detected),
+      confidence: clamp(toNumber(raw.drought_confidence, 0.01), 0, 1),
+    },
+    oil_spill: {
+      detected: toBoolean(raw.oil_spill_detected),
+      confidence: clamp(toNumber(raw.oil_spill_confidence, 0.01), 0, 1),
+    },
+    deforestation: {
+      detected: toBoolean(raw.deforestation_detected),
+      confidence: clamp(toNumber(raw.deforestation_confidence, 0.01), 0, 1),
+    },
+  }
+
   return {
     fire_detected,
     confidence: Number(confidence.toFixed(3)),
     lat,
     lon,
     severity,
+    flood_detected: disasters.flood.detected,
+    drought_detected: disasters.drought.detected,
+    oil_spill_detected: disasters.oil_spill.detected,
+    deforestation_detected: disasters.deforestation.detected,
+    disasters,
   }
 }
 
@@ -279,36 +332,100 @@ function buildResult(
 function applyDecisionPolicy(
   result: InferenceResult["result"]
 ): InferenceResult["result"] {
-  if (!result.fire_detected) {
-    return result
-  }
-
   const minConfidence =
     IMAGE_PROVIDER === "mapbox"
       ? Math.max(FIRE_MIN_CONFIDENCE, FIRE_MAPBOX_MIN_CONFIDENCE)
       : FIRE_MIN_CONFIDENCE
+  const strictDisasterMin =
+    IMAGE_PROVIDER === "mapbox"
+      ? Math.max(DISASTER_MIN_CONFIDENCE, DISASTER_STRICT_MIN_CONFIDENCE)
+      : DISASTER_MIN_CONFIDENCE
 
-  if (result.confidence < minConfidence) {
-    return {
-      ...result,
-      fire_detected: false,
-      severity: "low" as Severity,
-    }
+  const adjusted: InferenceResult["result"] = {
+    ...result,
+    disasters: {
+      flood: {
+        ...result.disasters.flood,
+        detected:
+          result.disasters.flood.detected &&
+          result.disasters.flood.confidence >= strictDisasterMin,
+      },
+      drought: {
+        ...result.disasters.drought,
+        detected:
+          result.disasters.drought.detected &&
+          result.disasters.drought.confidence >= strictDisasterMin,
+      },
+      oil_spill: {
+        ...result.disasters.oil_spill,
+        detected:
+          result.disasters.oil_spill.detected &&
+          result.disasters.oil_spill.confidence >= strictDisasterMin,
+      },
+      deforestation: {
+        ...result.disasters.deforestation,
+        detected:
+          result.disasters.deforestation.detected &&
+          result.disasters.deforestation.confidence >= strictDisasterMin,
+      },
+    },
   }
 
-  if (
-    result.severity === "low" &&
-    !FIRE_ALLOW_LOW_SEVERITY &&
-    result.confidence < FIRE_LOW_SEVERITY_OVERRIDE_CONFIDENCE
-  ) {
-    return {
-      ...result,
-      fire_detected: false,
-      severity: "low" as Severity,
-    }
+  adjusted.flood_detected = adjusted.disasters.flood.detected
+  adjusted.drought_detected = adjusted.disasters.drought.detected
+  adjusted.oil_spill_detected = adjusted.disasters.oil_spill.detected
+  adjusted.deforestation_detected = adjusted.disasters.deforestation.detected
+
+  const firePassedThreshold =
+    adjusted.fire_detected && adjusted.confidence >= minConfidence
+  const allowLowSeverityFire =
+    FIRE_ALLOW_LOW_SEVERITY ||
+    adjusted.severity !== "low" ||
+    adjusted.confidence >= FIRE_LOW_SEVERITY_OVERRIDE_CONFIDENCE
+
+  adjusted.fire_detected = firePassedThreshold && allowLowSeverityFire
+
+  if (!hasAnyDetection(adjusted)) {
+    adjusted.severity = "low"
+  } else if (adjusted.confidence >= 0.9) {
+    adjusted.severity = "high"
+  } else if (adjusted.confidence >= 0.8) {
+    adjusted.severity = "medium"
   }
 
-  return result
+  return adjusted
+}
+
+function defaultDisasterAssessments(): DisasterAssessments {
+  return {
+    flood: { detected: false, confidence: 0.01 },
+    drought: { detected: false, confidence: 0.01 },
+    oil_spill: { detected: false, confidence: 0.01 },
+    deforestation: { detected: false, confidence: 0.01 },
+  }
+}
+
+function toBoolean(value: unknown): boolean {
+  if (typeof value === "boolean") {
+    return value
+  }
+  if (typeof value === "number") {
+    return value !== 0
+  }
+  if (typeof value === "string") {
+    return ["true", "1", "yes"].includes(value.toLowerCase())
+  }
+  return false
+}
+
+function hasAnyDetection(result: InferenceResult["result"]): boolean {
+  return (
+    result.fire_detected ||
+    result.flood_detected ||
+    result.drought_detected ||
+    result.oil_spill_detected ||
+    result.deforestation_detected
+  )
 }
 
 function buildDataUrl(base64: string, mime?: string | null): string {

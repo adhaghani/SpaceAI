@@ -44,6 +44,16 @@ type ApiState = {
     lat: number
     lon: number
     severity: "low" | "medium" | "high"
+    flood_detected: boolean
+    drought_detected: boolean
+    oil_spill_detected: boolean
+    deforestation_detected: boolean
+    disasters: {
+      flood: { detected: boolean; confidence: number }
+      drought: { detected: boolean; confidence: number }
+      oil_spill: { detected: boolean; confidence: number }
+      deforestation: { detected: boolean; confidence: number }
+    }
   }
   vlm_payload_json: string | null
   bandwidth: {
@@ -86,6 +96,16 @@ type AlertPayload = {
   lat: number
   lon: number
   severity: "low" | "medium" | "high"
+  flood_detected: boolean
+  drought_detected: boolean
+  oil_spill_detected: boolean
+  deforestation_detected: boolean
+  disasters: {
+    flood: { detected: boolean; confidence: number }
+    drought: { detected: boolean; confidence: number }
+    oil_spill: { detected: boolean; confidence: number }
+    deforestation: { detected: boolean; confidence: number }
+  }
 }
 
 const defaultState: ApiState = {
@@ -105,6 +125,16 @@ const defaultState: ApiState = {
     lat: 0,
     lon: 0,
     severity: "low",
+    flood_detected: false,
+    drought_detected: false,
+    oil_spill_detected: false,
+    deforestation_detected: false,
+    disasters: {
+      flood: { detected: false, confidence: 0 },
+      drought: { detected: false, confidence: 0 },
+      oil_spill: { detected: false, confidence: 0 },
+      deforestation: { detected: false, confidence: 0 },
+    },
   },
   vlm_payload_json: null,
   bandwidth: {
@@ -250,15 +280,7 @@ export default function Page() {
         const parsed = JSON.parse(
           state.vlm_payload_json
         ) as Partial<AlertPayload>
-        if (
-          typeof parsed.fire_detected === "boolean" &&
-          typeof parsed.confidence === "number" &&
-          typeof parsed.lat === "number" &&
-          typeof parsed.lon === "number" &&
-          (parsed.severity === "low" ||
-            parsed.severity === "medium" ||
-            parsed.severity === "high")
-        ) {
+        if (isAlertPayload(parsed)) {
           return parsed as AlertPayload
         }
       } catch {
@@ -269,11 +291,17 @@ export default function Page() {
     return state.vlm_result
   }, [state.vlm_payload_json, state.vlm_result])
 
+  const hasAnyDetection =
+    aiPayload.fire_detected ||
+    aiPayload.flood_detected ||
+    aiPayload.drought_detected ||
+    aiPayload.oil_spill_detected ||
+    aiPayload.deforestation_detected
   const alertVariant =
-    hasAIResult && aiPayload.fire_detected ? "destructive" : "secondary"
+    hasAIResult && hasAnyDetection ? "destructive" : "secondary"
   const alertLabel = hasAIResult
-    ? aiPayload.fire_detected
-      ? "FIRE DETECTED"
+    ? hasAnyDetection
+      ? "DISASTER SIGNAL DETECTED"
       : "CLEAR"
     : "SIMULATION ONLY"
   const hasObservation = Boolean(imageUrl)
@@ -510,8 +538,40 @@ export default function Page() {
                       value={aiPayload.fire_detected ? "Yes" : "No"}
                     />
                     <MetricRow
+                      label="Flood Detected"
+                      value={aiPayload.flood_detected ? "Yes" : "No"}
+                    />
+                    <MetricRow
+                      label="Drought Detected"
+                      value={aiPayload.drought_detected ? "Yes" : "No"}
+                    />
+                    <MetricRow
+                      label="Oil Spill Detected"
+                      value={aiPayload.oil_spill_detected ? "Yes" : "No"}
+                    />
+                    <MetricRow
+                      label="Deforestation Detected"
+                      value={aiPayload.deforestation_detected ? "Yes" : "No"}
+                    />
+                    <MetricRow
                       label="Confidence"
                       value={`${(aiPayload.confidence * 100).toFixed(1)}%`}
+                    />
+                    <MetricRow
+                      label="Flood Confidence"
+                      value={`${(aiPayload.disasters.flood.confidence * 100).toFixed(1)}%`}
+                    />
+                    <MetricRow
+                      label="Drought Confidence"
+                      value={`${(aiPayload.disasters.drought.confidence * 100).toFixed(1)}%`}
+                    />
+                    <MetricRow
+                      label="Oil Spill Confidence"
+                      value={`${(aiPayload.disasters.oil_spill.confidence * 100).toFixed(1)}%`}
+                    />
+                    <MetricRow
+                      label="Deforestation Confidence"
+                      value={`${(aiPayload.disasters.deforestation.confidence * 100).toFixed(1)}%`}
                     />
                     <MetricRow
                       label="Latitude"
@@ -566,7 +626,7 @@ export default function Page() {
               <Progress value={cumulativeSavingsPercent} className="h-2" />
               <div className="text-xs text-muted-foreground">
                 Mission goal: maximize cumulative downlink efficiency while
-                preserving actionable fire alerts.
+                preserving actionable disaster alerts.
               </div>
             </CardContent>
           </Card>
@@ -708,4 +768,31 @@ function formatTimestamp(value: string) {
     return value
   }
   return date.toLocaleTimeString()
+}
+
+function isAlertPayload(
+  payload: Partial<AlertPayload>
+): payload is AlertPayload {
+  return (
+    typeof payload.fire_detected === "boolean" &&
+    typeof payload.confidence === "number" &&
+    typeof payload.lat === "number" &&
+    typeof payload.lon === "number" &&
+    typeof payload.flood_detected === "boolean" &&
+    typeof payload.drought_detected === "boolean" &&
+    typeof payload.oil_spill_detected === "boolean" &&
+    typeof payload.deforestation_detected === "boolean" &&
+    (payload.severity === "low" ||
+      payload.severity === "medium" ||
+      payload.severity === "high") &&
+    !!payload.disasters &&
+    typeof payload.disasters.flood?.detected === "boolean" &&
+    typeof payload.disasters.flood?.confidence === "number" &&
+    typeof payload.disasters.drought?.detected === "boolean" &&
+    typeof payload.disasters.drought?.confidence === "number" &&
+    typeof payload.disasters.oil_spill?.detected === "boolean" &&
+    typeof payload.disasters.oil_spill?.confidence === "number" &&
+    typeof payload.disasters.deforestation?.detected === "boolean" &&
+    typeof payload.disasters.deforestation?.confidence === "number"
+  )
 }
