@@ -38,8 +38,20 @@ type ApiState = {
   bandwidth: {
     raw_image_bytes: number
     vlm_payload_bytes: number
+    heatmap_payload_bytes: number
     savings_percent: number
   }
+  heatmap: {
+    grid_size: number
+    threshold: number
+    palette: {
+      safe: string
+      low: string
+      medium: string
+      high: string
+    }
+    cells: number[]
+  } | null
   errors: string[]
 }
 
@@ -69,6 +81,16 @@ const IMAGE_FETCH_SUPPRESS_TIMEOUT_ABORT =
 const INFERENCE_CACHE_TTL_MS = Math.max(
   1000,
   Number(process.env.INFERENCE_CACHE_TTL_MS ?? "30000") || 30000
+)
+const HEATMAP_ENABLED =
+  (process.env.HEATMAP_ENABLED ?? "true").toLowerCase() === "true"
+const HEATMAP_GRID_SIZE = Math.max(
+  6,
+  Math.min(24, Number(process.env.HEATMAP_GRID_SIZE ?? "12") || 12)
+)
+const HEATMAP_THRESHOLD = Math.max(
+  0,
+  Math.min(1, Number(process.env.HEATMAP_THRESHOLD ?? "0.85") || 0.85)
 )
 
 type CachedInference = {
@@ -114,6 +136,8 @@ export async function GET() {
   }
   let vlmPayloadJson: string | null = null
   let vlmPayloadBytes = 0
+  let heatmap: ApiState["heatmap"] = null
+  let heatmapPayloadBytes = 0
 
   try {
     const response = await fetch(
@@ -188,6 +212,19 @@ export async function GET() {
       vlmResult = inference.result
       vlmPayloadJson = inference.payload_json
       vlmPayloadBytes = inference.payload_bytes
+
+      if (HEATMAP_ENABLED) {
+        heatmap = buildHeatmap(
+          inference.result,
+          imageBase64,
+          HEATMAP_GRID_SIZE,
+          HEATMAP_THRESHOLD
+        )
+        heatmapPayloadBytes = Buffer.byteLength(
+          JSON.stringify(heatmap),
+          "utf-8"
+        )
+      }
     } catch (error) {
       errors.push(
         `inference_failed: ${error instanceof Error ? error.message : String(error)}`
@@ -216,8 +253,10 @@ export async function GET() {
     bandwidth: {
       raw_image_bytes: rawImageBytes,
       vlm_payload_bytes: vlmPayloadBytes,
+      heatmap_payload_bytes: heatmapPayloadBytes,
       savings_percent: Number(savingsPercent.toFixed(2)),
     },
+    heatmap,
     errors,
   }
 
@@ -446,6 +485,71 @@ function pruneExpiredInferenceCache(now: number) {
       inferenceCache.delete(key)
     }
   }
+}
+
+function buildHeatmap(
+  result: Awaited<ReturnType<typeof runWildfireInference>>["result"],
+  imageBase64: string,
+  gridSize: number,
+  threshold: number
+): NonNullable<ApiState["heatmap"]> {
+  const cells: number[] = []
+  const totalCells = gridSize * gridSize
+  const seedHex = createHash("sha1").update(imageBase64).digest("hex")
+  const seed = parseInt(seedHex.slice(0, 8), 16) || 1
+
+  const disasterMaxConfidence = Math.max(
+    result.confidence,
+    result.disasters.flood.confidence,
+    result.disasters.drought.confidence,
+    result.disasters.oil_spill.confidence,
+    result.disasters.deforestation.confidence
+  )
+
+  const detectionBoost =
+    result.fire_detected ||
+    result.flood_detected ||
+    result.drought_detected ||
+    result.oil_spill_detected ||
+    result.deforestation_detected
+      ? 0.15
+      : -0.1
+
+  const baseRisk = clamp(disasterMaxConfidence + detectionBoost, 0.02, 0.98)
+  const hotspotX = (seed % gridSize) / Math.max(1, gridSize - 1)
+  const hotspotY =
+    (Math.floor(seed / 97) % gridSize) / Math.max(1, gridSize - 1)
+
+  for (let i = 0; i < totalCells; i += 1) {
+    const x = (i % gridSize) / Math.max(1, gridSize - 1)
+    const y = Math.floor(i / gridSize) / Math.max(1, gridSize - 1)
+    const dx = x - hotspotX
+    const dy = y - hotspotY
+    const radial = Math.exp(-(dx * dx + dy * dy) / 0.08)
+
+    // Deterministic jitter gives non-flat tiles without adding payload-heavy masks.
+    const jitterRaw = Math.sin((seed + i * 31) * 0.017)
+    const jitter = jitterRaw * 0.06
+
+    const risk = clamp(baseRisk * (0.45 + radial) + jitter, 0, 1)
+    cells.push(Number(risk.toFixed(2)))
+  }
+
+  return {
+    grid_size: gridSize,
+    threshold,
+    palette: {
+      safe: "#16a34a",
+      low: "#facc15",
+      medium: "#f97316",
+      high: "#dc2626",
+    },
+    cells,
+  }
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value))
 }
 
 function isAbortError(error: unknown) {

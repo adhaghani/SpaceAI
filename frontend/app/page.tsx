@@ -59,8 +59,20 @@ type ApiState = {
   bandwidth: {
     raw_image_bytes: number
     vlm_payload_bytes: number
+    heatmap_payload_bytes: number
     savings_percent: number
   }
+  heatmap: {
+    grid_size: number
+    threshold: number
+    palette: {
+      safe: string
+      low: string
+      medium: string
+      high: string
+    }
+    cells: number[]
+  } | null
   errors: string[]
 }
 
@@ -88,6 +100,7 @@ type ControlResponse = {
 type CumulativeBandwidth = {
   rawImageBytes: number
   vlmPayloadBytes: number
+  heatmapPayloadBytes: number
 }
 
 type AlertPayload = {
@@ -140,8 +153,10 @@ const defaultState: ApiState = {
   bandwidth: {
     raw_image_bytes: 0,
     vlm_payload_bytes: 0,
+    heatmap_payload_bytes: 0,
     savings_percent: 0,
   },
+  heatmap: null,
   errors: [],
 }
 
@@ -157,7 +172,10 @@ export default function Page() {
     useState<CumulativeBandwidth>({
       rawImageBytes: 0,
       vlmPayloadBytes: 0,
+      heatmapPayloadBytes: 0,
     })
+  const [showHeatmap, setShowHeatmap] = useState(true)
+  const [heatmapOpacity, setHeatmapOpacity] = useState(58)
 
   const addRequestLog = (log: Omit<RequestLog, "id">) => {
     setRequestLogs((prev) => {
@@ -215,6 +233,9 @@ export default function Page() {
           vlmPayloadBytes:
             prev.vlmPayloadBytes +
             Math.max(0, json.bandwidth.vlm_payload_bytes),
+          heatmapPayloadBytes:
+            prev.heatmapPayloadBytes +
+            Math.max(0, json.bandwidth.heatmap_payload_bytes),
         }))
         setFetchError(null)
         setFetchStatus(null)
@@ -469,17 +490,17 @@ export default function Page() {
             </CardHeader>
             <CardContent>
               {loading ? (
-                <div className="flex h-72 items-center justify-center rounded-xl border border-border/60 bg-muted/35 text-sm text-muted-foreground">
+                <div className="flex aspect-square items-center justify-center rounded-xl border border-border/60 bg-muted/35 text-sm text-muted-foreground">
                   Awaiting stream...
                 </div>
               ) : hasServerStateError ? (
-                <div className="flex h-72 flex-col items-center justify-center gap-2 rounded-xl border border-destructive/40 bg-destructive/10 text-center text-sm text-destructive">
+                <div className="flex aspect-square flex-col items-center justify-center gap-2 rounded-xl border border-destructive/40 bg-destructive/10 text-center text-sm text-destructive">
                   <AlertTriangle />
                   State service returned {fetchStatus}. Observation stream is
                   temporarily unavailable.
                 </div>
               ) : imageUrl && !imageLoadError ? (
-                <div className="relative h-76 w-full overflow-hidden rounded-xl border border-border/70">
+                <div className="relative aspect-square overflow-hidden rounded-xl border border-border/70">
                   <Image
                     src={imageUrl}
                     alt="Current Sentinel-2 false color frame"
@@ -489,6 +510,30 @@ export default function Page() {
                     className="aspect-square object-cover"
                     onError={() => setImageLoadError(true)}
                   />
+                  {showHeatmap && state.heatmap ? (
+                    <div
+                      className="pointer-events-none absolute inset-0"
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: `repeat(${state.heatmap.grid_size}, minmax(0, 1fr))`,
+                      }}
+                    >
+                      {state.heatmap.cells.map((risk, index) => (
+                        <div
+                          key={index}
+                          className="h-full w-full"
+                          style={{
+                            backgroundColor: getHeatmapColor(
+                              risk,
+                              state.heatmap!
+                            ),
+                            opacity:
+                              (heatmapOpacity / 100) * (0.2 + risk * 0.8),
+                          }}
+                        />
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               ) : imageLoadError ? (
                 <div className="flex h-72 flex-col items-center justify-center gap-2 rounded-xl border border-destructive/40 bg-destructive/10 text-center text-sm text-destructive">
@@ -503,6 +548,59 @@ export default function Page() {
                   valid window).
                 </div>
               )}
+
+              {state.heatmap ? (
+                <div className="mt-3 rounded-lg border border-border/60 bg-muted/25 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
+                    <div className="font-medium">Risk Heatmap Overlay</div>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={showHeatmap ? "default" : "outline"}
+                        onClick={() => setShowHeatmap((prev) => !prev)}
+                      >
+                        {showHeatmap ? "Overlay On" : "Overlay Off"}
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="mt-2 flex items-center gap-3 text-xs">
+                    <span>Opacity</span>
+                    <input
+                      type="range"
+                      min={20}
+                      max={90}
+                      step={1}
+                      value={heatmapOpacity}
+                      onChange={(event) =>
+                        setHeatmapOpacity(Number(event.target.value))
+                      }
+                      className="w-36"
+                    />
+                    <span className="font-mono">{heatmapOpacity}%</span>
+                    <span className="font-mono text-muted-foreground">
+                      threshold: {state.heatmap.threshold.toFixed(2)}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-3 text-xs">
+                    <LegendDot
+                      color={state.heatmap.palette.safe}
+                      label="Safe"
+                    />
+                    <LegendDot color={state.heatmap.palette.low} label="Low" />
+                    <LegendDot
+                      color={state.heatmap.palette.medium}
+                      label="Medium"
+                    />
+                    <LegendDot
+                      color={state.heatmap.palette.high}
+                      label="High"
+                    />
+                  </div>
+                </div>
+              ) : null}
             </CardContent>
           </Card>
         </section>
@@ -532,7 +630,7 @@ export default function Page() {
                     </Badge>
                   </div>
                   <Separator />
-                  <div className="grid gap-2 rounded-lg border border-border/70 bg-muted/35 p-3 text-sm">
+                  <div className="grid grid-cols-2 gap-2 rounded-lg border border-border/70 bg-muted/35 p-3 text-sm">
                     <MetricRow
                       label="Fire Detected"
                       value={aiPayload.fire_detected ? "Yes" : "No"}
@@ -622,6 +720,10 @@ export default function Page() {
               <MetricRow
                 label="Estimated Savings"
                 value={`${cumulativeSavingsPercent.toFixed(2)}%`}
+              />
+              <MetricRow
+                label="Heatmap Payload"
+                value={formatBytes(cumulativeBandwidth.heatmapPayloadBytes)}
               />
               <Progress value={cumulativeSavingsPercent} className="h-2" />
               <div className="text-xs text-muted-foreground">
@@ -731,6 +833,18 @@ function MetricRow({ label, value }: { label: string; value: string }) {
   )
 }
 
+function LegendDot({ color, label }: { color: string; label: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span
+        className="h-2.5 w-2.5 rounded-full"
+        style={{ backgroundColor: color }}
+      />
+      <span>{label}</span>
+    </div>
+  )
+}
+
 function formatNumber(value: number | null, digits: number) {
   if (value === null || Number.isNaN(value)) {
     return "-"
@@ -768,6 +882,22 @@ function formatTimestamp(value: string) {
     return value
   }
   return date.toLocaleTimeString()
+}
+
+function getHeatmapColor(
+  risk: number,
+  heatmap: NonNullable<ApiState["heatmap"]>
+) {
+  if (risk >= heatmap.threshold) {
+    return heatmap.palette.high
+  }
+  if (risk >= 0.65) {
+    return heatmap.palette.medium
+  }
+  if (risk >= 0.4) {
+    return heatmap.palette.low
+  }
+  return heatmap.palette.safe
 }
 
 function isAlertPayload(

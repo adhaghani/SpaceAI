@@ -75,14 +75,33 @@ const DISASTER_STRICT_MIN_CONFIDENCE = clamp(
   0,
   1
 )
+const POLAR_FIRE_GUARD_ENABLED =
+  (process.env.POLAR_FIRE_GUARD_ENABLED ?? "true").toLowerCase() === "true"
+const POLAR_LATITUDE_THRESHOLD = clamp(
+  Number(process.env.POLAR_LATITUDE_THRESHOLD ?? "60"),
+  0,
+  90
+)
+const POLAR_FIRE_MIN_CONFIDENCE = clamp(
+  Number(process.env.POLAR_FIRE_MIN_CONFIDENCE ?? "0.985"),
+  0,
+  1
+)
+const POLAR_FIRE_REQUIRE_HIGH_SEVERITY =
+  (process.env.POLAR_FIRE_REQUIRE_HIGH_SEVERITY ?? "true").toLowerCase() ===
+  "true"
 
 const VLM_PROMPT_SENTINEL =
   "Satellite disaster triage (precision-first). Analyze Sentinel-2 false-color image for wildfire, flood, drought, oil spill, and deforestation evidence. " +
+  "If the scene is mostly snow, ice, or cloud with no clear smoke source/flame front, wildfire must be false. " +
+  "For polar regions (e.g., Antarctica/Greenland), default wildfire=false unless explicit active burn plume is visible. " +
   "Avoid weak/ambiguous cues. If unsure, mark false with low confidence. Return STRICT JSON only: " +
   '{"fire_detected":bool,"flood_detected":bool,"drought_detected":bool,"oil_spill_detected":bool,"deforestation_detected":bool,"confidence":0-1,"flood_confidence":0-1,"drought_confidence":0-1,"oil_spill_confidence":0-1,"deforestation_confidence":0-1,"lat":number,"lon":number,"severity":"low|medium|high"}'
 
 const VLM_PROMPT_MAPBOX =
   "Satellite disaster triage on RGB imagery (precision-first). Detect only strong visual evidence for wildfire, flood, drought, oil spill, and deforestation. " +
+  "If imagery is dominated by snow/ice/cloud and lacks a clear smoke plume source, wildfire must be false. " +
+  "For polar regions, default wildfire=false unless explicit active fire signatures are visible. " +
   "Do not infer thermal cues from color alone. If uncertain, return false with low confidence. Return STRICT JSON only: " +
   '{"fire_detected":bool,"flood_detected":bool,"drought_detected":bool,"oil_spill_detected":bool,"deforestation_detected":bool,"confidence":0-1,"flood_confidence":0-1,"drought_confidence":0-1,"oil_spill_confidence":0-1,"deforestation_confidence":0-1,"lat":number,"lon":number,"severity":"low|medium|high"}'
 
@@ -119,8 +138,9 @@ export async function runWildfireInference(
     const parsed = extractJsonObject(content)
     const normalized = normalizeResult(parsed, lat, lon)
     const policyAdjusted = applyDecisionPolicy(normalized)
+    const polarAdjusted = applyPolarFireGuard(policyAdjusted)
     return buildResult(
-      policyAdjusted,
+      polarAdjusted,
       `lm-studio:${LM_STUDIO_MODEL}`,
       promptUsed
     )
@@ -394,6 +414,37 @@ function applyDecisionPolicy(
   }
 
   return adjusted
+}
+
+function applyPolarFireGuard(
+  result: InferenceResult["result"]
+): InferenceResult["result"] {
+  if (!POLAR_FIRE_GUARD_ENABLED || !result.fire_detected) {
+    return result
+  }
+
+  if (Math.abs(result.lat) < POLAR_LATITUDE_THRESHOLD) {
+    return result
+  }
+
+  const severityGatePassed =
+    !POLAR_FIRE_REQUIRE_HIGH_SEVERITY || result.severity === "high"
+  const confidenceGatePassed = result.confidence >= POLAR_FIRE_MIN_CONFIDENCE
+
+  if (severityGatePassed && confidenceGatePassed) {
+    return result
+  }
+
+  const suppressed: InferenceResult["result"] = {
+    ...result,
+    fire_detected: false,
+  }
+
+  if (!hasAnyDetection(suppressed)) {
+    suppressed.severity = "low"
+  }
+
+  return suppressed
 }
 
 function defaultDisasterAssessments(): DisasterAssessments {
